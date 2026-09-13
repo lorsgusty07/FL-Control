@@ -197,65 +197,78 @@ def load_natural_workload_clients(workload: str):
             target_zip = zip_candidates[0]
             extracted_dir = DATA_DIR / "WISDM_extracted"
             if not extracted_dir.exists():
+                print(f"Extracting {target_zip}...")
                 with zipfile.ZipFile(target_zip, 'r') as z:
                     z.extractall(extracted_dir)
 
-        if extracted_dir is None:
+        if extracted_dir is None or not extracted_dir.exists():
             raise FileNotFoundError("Could not find WISDM-2019 directory or zip archive.")
 
-        # Find raw csv files by subject
-        raw_files = sorted(glob.glob(str(extracted_dir / "**" / "data" / "**" / "*.txt"), recursive=True))
+        # Find raw text/csv files recursively
+        raw_files = sorted(glob.glob(str(extracted_dir / "**" / "*.txt"), recursive=True))
         if not raw_files:
             raw_files = sorted(glob.glob(str(extracted_dir / "**" / "*.csv"), recursive=True))
-            if not raw_files:
-                raw_files = sorted(glob.glob(str(extracted_dir / "**" / "*.txt"), recursive=True))
 
+        print(f"Found {len(raw_files)} WISDM raw data files in {extracted_dir}")
         activity_map = {}
-        for f in raw_files:
-            fname = Path(f).stem
-            # Typical naming includes subject id, e.g. data_1600_accel_phone.txt
-            parts = fname.split("_")
-            subject_id = None
-            for p in parts:
-                if p.isdigit() and len(p) >= 4:
-                    subject_id = p
-                    break
-            if subject_id is None:
-                subject_id = parts[1] if len(parts) > 1 else parts[0]
 
-            try:
-                df = pd.read_csv(f, header=None, error_bad_lines=False, warn_bad_lines=False, nrows=5000)
-                # Filter valid sensor reading rows (subject, activity, timestamp, x, y, z)
-                numeric_cols = df.select_dtypes(include=[np.number]).columns
-                if len(numeric_cols) >= 3:
-                    mat = df[numeric_cols[:3]].to_numpy(dtype=np.float32)
-                    labels = df.iloc[:, 1].astype(str).tolist()
-                    for l in labels:
-                        if l not in activity_map:
-                            activity_map[l] = len(activity_map)
-                    y_vec = np.array([activity_map[l] for l in labels], dtype=np.int64)
-
-                    # Window into segments of size 128
-                    win_size = 128
-                    n_wins = len(mat) // win_size
-                    if n_wins > 0:
-                        X_wins = mat[:n_wins * win_size].reshape(n_wins, 3, win_size)
-                        y_wins = y_vec[:n_wins * win_size:win_size]
-                        if subject_id not in clients:
-                            clients[subject_id] = {"X": [], "y": []}
-                        clients[subject_id]["X"].append(X_wins)
-                        clients[subject_id]["y"].append(y_wins)
-            except Exception:
+        for fpath in raw_files:
+            fname = Path(fpath).stem
+            # Filter out documentation/readme files
+            if fname.lower() in ["readme", "license", "description"] or fname.startswith("."):
                 continue
 
+            # Read lines directly to handle trailing semicolons cleanly
+            rows_X = []
+            rows_y = []
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                    for line_idx, line in enumerate(f):
+                        if line_idx >= 5000:
+                            break
+                        line = line.strip().rstrip(";")
+                        if not line:
+                            continue
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 6:
+                            sub_id = parts[0]
+                            act = parts[1]
+                            try:
+                                x_val = float(parts[3])
+                                y_val = float(parts[4])
+                                z_val = float(parts[5])
+                            except ValueError:
+                                continue
+                            if act not in activity_map:
+                                activity_map[act] = len(activity_map)
+                            rows_X.append([x_val, y_val, z_val])
+                            rows_y.append(activity_map[act])
+                            subject_id = sub_id
+            except Exception as e:
+                continue
+
+            if len(rows_X) >= 128:
+                mat = np.array(rows_X, dtype=np.float32)
+                y_vec = np.array(rows_y, dtype=np.int64)
+                win_size = 128
+                n_wins = len(mat) // win_size
+                if n_wins > 0:
+                    X_wins = mat[:n_wins * win_size].reshape(n_wins, 3, win_size)
+                    y_wins = y_vec[:n_wins * win_size:win_size]
+                    if subject_id not in clients:
+                        clients[subject_id] = {"X": [], "y": []}
+                    clients[subject_id]["X"].append(X_wins)
+                    clients[subject_id]["y"].append(y_wins)
+
         for sid in list(clients.keys()):
-            X = np.concatenate(clients[sid]["X"], axis=0)
-            y = np.concatenate(clients[sid]["y"], axis=0)
-            n_tr = int(0.8 * len(y))
-            clients[sid] = {
-                "train_X": X[:n_tr], "train_y": y[:n_tr],
-                "test_X": X[n_tr:], "test_y": y[n_tr:]
-            }
+            if clients[sid]["X"]:
+                X = np.concatenate(clients[sid]["X"], axis=0)
+                y = np.concatenate(clients[sid]["y"], axis=0)
+                n_tr = int(0.8 * len(y))
+                clients[sid] = {
+                    "train_X": X[:n_tr], "train_y": y[:n_tr],
+                    "test_X": X[n_tr:], "test_y": y[n_tr:]
+                }
 
     if len(clients) == 0:
         raise RuntimeError(f"No clients successfully loaded for workload: {workload}")
