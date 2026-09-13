@@ -96,7 +96,7 @@ class FemnistCNN(nn.Module):
 
 class Wisdm1DCNN(nn.Module):
     """1D-CNN 64/128 + global pooling for 18 classes (WISDM 2019)."""
-    def __init__(self, in_channels=6, num_classes=18):
+    def __init__(self, in_channels=3, num_classes=18):
         super().__init__()
         self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=5, padding=2)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
