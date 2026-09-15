@@ -3,7 +3,12 @@ env/
 .env/
 venv/
 
- Python cache files
+# Python cache files
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Experiment result files
+*.csv
+results/
+student_runs/

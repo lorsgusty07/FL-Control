@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import argparse
+import bisect
 import copy
 import glob
 import itertools
@@ -284,25 +285,25 @@ class FedScaleProfile:
         self.compute_speed = float(compute_speed)       # ms per sample
         self.bandwidth = float(bandwidth)               # KB/s
         self.avail_trace = avail_trace
-        self.behavior_index = 0
 
     def is_active(self, cur_time: float) -> bool:
-        """Evaluate FLASH real client availability trace at given wall-clock time."""
+        """Evaluate FLASH real client availability trace at given wall-clock time (stateless)."""
         if not self.avail_trace:
             return True
         finish_time = self.avail_trace.get("finish_time", 86400 * 7)
+        if finish_time <= 0:
+            return True
         norm_time = cur_time % finish_time
         actives = self.avail_trace.get("active", [])
         inactives = self.avail_trace.get("inactive", [])
         if not actives or not inactives:
             return True
 
-        # Advance behavior index to current segment
-        while self.behavior_index < len(inactives) and norm_time > inactives[self.behavior_index]:
-            self.behavior_index += 1
-        self.behavior_index %= len(actives)
-
-        return actives[self.behavior_index] <= norm_time <= inactives[self.behavior_index]
+        # Stateless binary search to find matching interval without mutating pointers
+        idx = bisect.bisect_right(inactives, norm_time)
+        if idx < len(actives):
+            return actives[idx] <= norm_time <= inactives[idx]
+        return False
 
     def estimate_round_time(self, num_samples: int, epochs: int, model_bytes: int) -> float:
         """Compute execution time based on real AIBench latency & MobiPerf bandwidth."""
@@ -501,12 +502,16 @@ def run(workload_name: str):
             f1_history = []
             fairness_losses = []
 
-            for r in range(1, cfg.rounds + 1):
+            r = 1
+            max_attempts = cfg.rounds * 10
+            attempts = 0
+            while r <= cfg.rounds and attempts < max_attempts:
+                attempts += 1
                 # 1. Check availability
                 available = [w for w in paired_clients if paired_profiles[w].is_active(cur_clock)]
                 if len(available) < cfg.clients_per_round:
-                    # Not enough available clients at this timestamp
-                    cur_clock += 60.0  # Advance clock 1 minute
+                    # If not enough clients available right now, advance clock by 30s
+                    cur_clock += 30.0
                     continue
 
                 # 2. Compute current client losses
@@ -570,6 +575,7 @@ def run(workload_name: str):
                     "wall_clock_sec": cur_clock,
                     "bytes_round": len(states) * model_size * 2
                 })
+                r += 1
 
             # Calculate summary metrics for this seed & policy
             p95_time = float(np.percentile(round_times, 95)) if round_times else 0.0
