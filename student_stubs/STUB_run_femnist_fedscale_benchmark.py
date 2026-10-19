@@ -482,18 +482,14 @@ def run(workload_name: str):
         init_model = (FemnistCNN(num_classes) if workload_name == "femnist" else Wisdm1DCNN(num_classes=num_classes)).to(DEVICE)
         model_size = get_model_size_bytes(init_model)
 
-        # Baseline calibration to determine the seed-specific SLO envelope
-        cal_costs = []
-        for w in paired_clients:
-            c = clients_pool[w]
-            st, ep, _, _ = adaptive_local_train(init_model, c["train_X"], c["train_y"], seed, max_epochs=10)
-            est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
-            cal_costs.append(est_t)
-
-        # Data-derived service envelope (Eq. 2 in Section III) with 35% enterprise operational headroom
-        HEADROOM_FACTOR = 1.35
-        slo_deadline = float(np.max(cal_costs) * HEADROOM_FACTOR)
-        print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s (headroom={HEADROOM_FACTOR}x)")
+        # Contractual workload calibration (Section III, Eq. 2: B = max_i c_i^{contract})
+        # Evaluated at the maximum contractual workload boundary (epochs = 10)
+        cal_costs = [
+            paired_profiles[w].estimate_round_time(len(clients_pool[w]["train_y"]), 10, model_size)
+            for w in paired_clients
+        ]
+        slo_deadline = float(np.max(cal_costs))
+        print(f"Seed {seed} SLO Deadline (Contract Envelope B): {slo_deadline:.2f}s")
 
         for policy in POLICIES:
             print(f"  -> Policy: {policy.upper()}")
