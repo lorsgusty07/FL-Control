@@ -12,3 +12,13 @@ __pycache__/
 *.csv
 results/
 student_runs/
+01_introduction.tex
+02_related_work.tex
+03_method.tex
+04_methodology.tex
+05_results.tex
+conclusions.tex
+model-generalization.png
+pareto-operating.png
+refs.bib
+training-time-acceleration.png

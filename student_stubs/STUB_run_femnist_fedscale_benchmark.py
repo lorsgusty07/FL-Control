@@ -27,8 +27,13 @@ from torch import nn
 from torch.nn import functional as F
 from sklearn.metrics import f1_score, accuracy_score
 
-# Deterministic thread execution
-torch.set_num_threads(1)
+# Detect GPU device (T4 on Google Colab or fallback to CPU)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if DEVICE.type == "cuda":
+    # Enable cuDNN benchmark for optimized conv operations
+    torch.backends.cudnn.benchmark = True
+else:
+    torch.set_num_threads(1)
 
 # Dynamically locate DATA_DIR and OUT_DIR across local and Colab environments
 def resolve_directories():
@@ -346,26 +351,26 @@ def get_model_size_bytes(model: nn.Module) -> int:
 def local_loss(model: nn.Module, X: np.ndarray, y: np.ndarray) -> float:
     model.eval()
     with torch.no_grad():
-        xt = torch.tensor(X, dtype=torch.float32)
-        yt = torch.tensor(y, dtype=torch.long)
+        xt = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+        yt = torch.tensor(y, dtype=torch.long, device=DEVICE)
         logits = model(xt)
         return float(F.cross_entropy(logits, yt).item())
 
 def adaptive_local_train(global_model: nn.Module, X: np.ndarray, y: np.ndarray,
                          seed: int, rel_reduction=0.20, max_epochs=10, lr=0.01):
-    model = copy.deepcopy(global_model)
+    model = copy.deepcopy(global_model).to(DEVICE)
     model.train()
-    gen = torch.Generator().manual_seed(seed)
+    gen = torch.Generator(device=DEVICE if DEVICE.type == "cuda" else "cpu").manual_seed(seed)
     opt = torch.optim.SGD(model.parameters(), lr=lr)
-    xt = torch.tensor(X, dtype=torch.float32)
-    yt = torch.tensor(y, dtype=torch.long)
+    xt = torch.tensor(X, dtype=torch.float32, device=DEVICE)
+    yt = torch.tensor(y, dtype=torch.long, device=DEVICE)
     n = len(yt)
     start_loss = local_loss(model, X, y)
     target_loss = start_loss * (1.0 - rel_reduction)
     epochs = 0
 
     for ep in range(1, max_epochs + 1):
-        order = torch.randperm(n, generator=gen)
+        order = torch.randperm(n, generator=gen, device=DEVICE)
         batch_size = max(1, min(16, n))
         for idx in order.split(batch_size):
             opt.zero_grad(set_to_none=True)
@@ -377,7 +382,7 @@ def adaptive_local_train(global_model: nn.Module, X: np.ndarray, y: np.ndarray,
             break
 
     final_loss = local_loss(model, X, y)
-    state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
     return state, epochs, start_loss, final_loss
 
 def fedavg(states: list[dict], weights: list[float]) -> dict:
@@ -390,7 +395,8 @@ def fedavg(states: list[dict], weights: list[float]) -> dict:
 def evaluate_global(model: nn.Module, test_X: np.ndarray, test_y: np.ndarray):
     model.eval()
     with torch.no_grad():
-        logits = model(torch.tensor(test_X, dtype=torch.float32))
+        xt = torch.tensor(test_X, dtype=torch.float32, device=DEVICE)
+        logits = model(xt)
         preds = logits.argmax(1).cpu().numpy()
     acc = accuracy_score(test_y, preds)
     f1 = f1_score(test_y, preds, average="macro", zero_division=0)
@@ -473,7 +479,7 @@ def run(workload_name: str):
         # Common model initialization
         seed_all(seed)
         num_classes = 62 if workload_name == "femnist" else 18
-        init_model = FemnistCNN(num_classes) if workload_name == "femnist" else Wisdm1DCNN(num_classes=num_classes)
+        init_model = (FemnistCNN(num_classes) if workload_name == "femnist" else Wisdm1DCNN(num_classes=num_classes)).to(DEVICE)
         model_size = get_model_size_bytes(init_model)
 
         # Baseline calibration to determine the seed-specific SLO envelope
@@ -484,8 +490,8 @@ def run(workload_name: str):
             est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
             cal_costs.append(est_t)
 
-        # Fixed compute/system SLO deadline
-        slo_deadline = float(np.quantile(cal_costs, 0.80))
+        # Data-derived service envelope (Eq. 2 in Section III): maximum of observed calibration costs
+        slo_deadline = float(np.max(cal_costs))
         print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s")
 
         for policy in POLICIES:
