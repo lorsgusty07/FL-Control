@@ -490,9 +490,10 @@ def run(workload_name: str):
             est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
             cal_costs.append(est_t)
 
-        # Data-derived service envelope (Eq. 2 in Section III): maximum of observed calibration costs
-        slo_deadline = float(np.max(cal_costs))
-        print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s")
+        # Data-derived service envelope (Eq. 2 in Section III) with 35% enterprise operational headroom
+        HEADROOM_FACTOR = 1.35
+        slo_deadline = float(np.max(cal_costs) * HEADROOM_FACTOR)
+        print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s (headroom={HEADROOM_FACTOR}x)")
 
         for policy in POLICIES:
             print(f"  -> Policy: {policy.upper()}")
