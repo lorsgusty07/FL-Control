@@ -491,7 +491,7 @@ def run(workload_name: str):
             cal_costs.append(est_t)
 
         # Data-derived service envelope (Eq. 2 in Section III) with 90% enterprise operational headroom
-        HEADROOM_FACTOR = 1.45
+        HEADROOM_FACTOR = 0.90
         slo_deadline = float(np.max(cal_costs) * HEADROOM_FACTOR)
         print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s (headroom={HEADROOM_FACTOR}x)")
 
