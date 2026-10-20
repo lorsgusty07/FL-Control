@@ -9,7 +9,7 @@ Provides complete implementations for:
 - Output metrics: p95 round time, SLO satisfaction, availability misses, time-to-quality, fairness, and bytes
 """
 from __future__ import annotations
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, replace
 from pathlib import Path
 import argparse
 import bisect
@@ -61,7 +61,13 @@ def resolve_directories():
     return data_dir, out_dir
 
 DATA_DIR, OUT_DIR = resolve_directories()
-SEEDS = [17, 29, 43, 59, 71, 89, 107, 131, 167, 197]
+# 20 fixed seeds: the first 10 are the original ones (results remain comparable)
+SEEDS = [17, 29, 43, 59, 71, 89, 107, 131, 167, 197,
+         223, 251, 283, 311, 347, 379, 409, 443, 479, 509]
+
+# Seed-specific SLO deadline rule (Sec. III-B): B = q-quantile of calibration costs.
+# The same q is used for every workload; ablate with --slo-quantile 0.50 / 0.90.
+SLO_QUANTILE = 0.75
 POLICIES = ["random", "fastest", "loss", "oort", "flcontrol"]
 
 @dataclass(frozen=True)
@@ -74,8 +80,8 @@ class Workload:
     model: str
 
 WORKLOADS = {
-    "femnist": Workload("femnist", 3550, 20, 5, 100, "2-conv CNN + 128 FC, 62 classes"),
-    "wisdm2019": Workload("wisdm2019", 51, 20, 5, 80, "1D-CNN 64/128 + global pooling, 18 classes"),
+    "femnist": Workload("femnist", 3550, 20, 5, 300, "2-conv CNN + 128 FC, 62 classes"),
+    "wisdm2019": Workload("wisdm2019", 51, 20, 5, 300, "1D-CNN 64/128 + global pooling, 18 classes"),
 }
 
 # ==========================================
@@ -291,24 +297,66 @@ class FedScaleProfile:
         self.bandwidth = float(bandwidth)               # KB/s
         self.avail_trace = avail_trace
 
-    def is_active(self, cur_time: float) -> bool:
-        """Evaluate FLASH real client availability trace at given wall-clock time (stateless)."""
+    def _trace(self):
+        """Return (actives, inactives, finish_time) or None if the client is always available.
+
+        FLASH/FedScale format: aligned lists where the client is active on
+        [active[k], inactive[k]]; the trace repeats with period finish_time.
+        If the last active segment has no closing timestamp, it lasts until finish_time.
+        """
         if not self.avail_trace:
-            return True
-        finish_time = self.avail_trace.get("finish_time", 86400 * 7)
-        if finish_time <= 0:
-            return True
-        norm_time = cur_time % finish_time
+            return None
+        finish_time = float(self.avail_trace.get("finish_time", 86400 * 7))
         actives = self.avail_trace.get("active", [])
         inactives = self.avail_trace.get("inactive", [])
-        if not actives or not inactives:
-            return True
+        if finish_time <= 0 or not actives:
+            return None
+        return actives, inactives, finish_time
 
-        # Stateless binary search to find matching interval without mutating pointers
-        idx = bisect.bisect_right(inactives, norm_time)
-        if idx < len(actives):
-            return actives[idx] <= norm_time <= inactives[idx]
-        return False
+    @staticmethod
+    def _segment_end(inactives, k, finish_time):
+        return float(inactives[k]) if k < len(inactives) else finish_time
+
+    def is_active(self, cur_time: float) -> bool:
+        """Evaluate FLASH real client availability trace at given wall-clock time (stateless)."""
+        tr = self._trace()
+        if tr is None:
+            return True
+        actives, inactives, finish_time = tr
+        norm_time = cur_time % finish_time
+        # Last segment that started at or before norm_time
+        k = bisect.bisect_right(actives, norm_time) - 1
+        if k < 0:
+            return False
+        return norm_time <= self._segment_end(inactives, k, finish_time)
+
+    def first_inactive_time(self, start: float, end: float):
+        """Exact check over [start, end]: return the first absolute time the client is
+        unavailable, or None if it stays available during the whole interval."""
+        tr = self._trace()
+        if tr is None:
+            return None
+        actives, inactives, finish_time = tr
+        t = float(start)
+        for _ in range(100000):  # hard guard against malformed traces
+            if t > end:
+                return None
+            norm_time = t % finish_time
+            k = bisect.bisect_right(actives, norm_time) - 1
+            if k < 0:
+                return t
+            seg_end = self._segment_end(inactives, k, finish_time)
+            if norm_time > seg_end:
+                return t
+            abs_seg_end = t + (seg_end - norm_time)
+            if abs_seg_end >= end:
+                return None
+            # Step just past the segment end (handles contiguous segments and trace wrap-around)
+            t = abs_seg_end + 1e-6
+        return None
+
+    def is_active_interval(self, start: float, end: float) -> bool:
+        return self.first_inactive_time(start, end) is None
 
     def estimate_round_time(self, num_samples: int, epochs: int, model_bytes: int) -> float:
         """Compute execution time based on real AIBench latency & MobiPerf bandwidth."""
@@ -452,19 +500,85 @@ def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
 # ==========================================
 # Main Experiment Execution
 # ==========================================
-def run(workload_name: str):
+def jain_index(values) -> float:
+    """Jain's fairness index; 0.0 when every value is zero."""
+    arr = np.asarray(list(values), dtype=float)
+    total = arr.sum()
+    if arr.size == 0 or total <= 0:
+        return 0.0
+    return float(total ** 2 / (arr.size * (arr ** 2).sum() + 1e-9))
+
+# Per-seed metrics aggregated as mean/std across seeds.
+# time_to_quality_sec is NaN when the target was never reached, so its mean is
+# conditional on reached_target == 1; the mean of reached_target is the fraction reached.
+AGG_METRICS = [
+    "final_f1", "p95_round_time", "p95_round_time_uncapped",
+    "slo_rate", "slo_latency_rate", "mean_jain_round",
+    "availability_misses", "deadline_timeouts",
+    "time_to_quality_sec", "reached_target",
+    "fairness_index", "fairness_selection", "fairness_participation",
+    "total_bytes", "total_wall_clock_sec", "slo_deadline_sec",
+]
+
+def aggregate_seed_summaries(df_seeds: pd.DataFrame) -> pd.DataFrame:
+    cols = [c for c in AGG_METRICS if c in df_seeds.columns]
+    return df_seeds.groupby("policy").agg({c: ["mean", "std"] for c in cols}).reset_index()
+
+def _append_csv(rows: list[dict], path: Path):
+    if not rows:
+        return
+    df = pd.DataFrame(rows)
+    df.to_csv(path, mode="a", header=not path.exists(), index=False)
+
+def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_QUANTILE,
+        out_suffix: str = "", resume: bool = False):
     assert_sources(workload_name)
     cfg = WORKLOADS[workload_name]
+    if rounds:
+        cfg = replace(cfg, rounds=int(rounds))
+    seeds = [int(s) for s in (seeds or SEEDS)]
+
     clients_pool = load_natural_workload_clients(workload_name)
     profiles_pool = load_fedscale_profiles()
 
     workload_ids = list(clients_pool.keys())
     trace_ids = list(profiles_pool.keys())
 
-    all_round_metrics = []
-    seed_summaries = []
+    # Output files (one set per block, identified by --out-suffix)
+    tag = f"{workload_name}{out_suffix}"
+    rounds_ckpt = OUT_DIR / f"round_metrics_{tag}.csv"
+    seeds_ckpt = OUT_DIR / f"seed_summary_{tag}.csv"
+    calib_path = OUT_DIR / f"calibration_{tag}.json"
+    agg_path = OUT_DIR / f"aggregate_{tag}.csv"
+    config_path = OUT_DIR / f"experiment_config_{tag}.json"
 
-    for seed in SEEDS:
+    done_seeds: set[int] = set()
+    calibration: dict = {}
+    if resume and seeds_ckpt.exists():
+        prev = pd.read_csv(seeds_ckpt)
+        n_pol = prev.groupby("seed")["policy"].nunique()
+        done_seeds = {int(s) for s in n_pol[n_pol == len(POLICIES)].index}
+        if calib_path.exists():
+            calibration = json.loads(calib_path.read_text())
+        print(f"Resuming {tag}: seeds already complete -> {sorted(done_seeds)}")
+    elif not resume:
+        for p in (rounds_ckpt, seeds_ckpt, calib_path, agg_path):
+            if p.exists():
+                p.unlink()
+
+    # Composite (multi-dimensional) service SLO floors:
+    # a round meets the SLO only if it is feasible in latency (no timeout, no dropout),
+    # reaches a minimum global quality and keeps a minimum client-loss fairness.
+    F1_MIN = 0.53 if workload_name == "wisdm2019" else 0.22
+    JAIN_MIN = 0.53  # adjust after inspecting the per-round Jain distribution
+
+    # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
+    target_f1 = 0.22 if workload_name == "femnist" else 0.50
+
+    for seed in seeds:
+        if seed in done_seeds:
+            print(f"\n>>> Skipping seed {seed} (already in checkpoint)")
+            continue
         print(f"\n>>> Running Seed {seed} for Workload {workload_name}")
         # Deterministically pair 20 natural clients with 20 real trace profiles
         pairing = deterministic_pair(workload_ids, trace_ids, cfg.clients_per_seed, seed)
@@ -494,10 +608,23 @@ def run(workload_name: str):
             est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
             cal_costs.append(est_t)
 
-        # Workload-specific service envelope headroom (0.75 for FEMNIST, 2.05 for WISDM-2019)
-        HEADROOM_FACTOR = 0.75 if workload_name == "femnist" else 2.05
-        slo_deadline = float(np.max(cal_costs) * HEADROOM_FACTOR)
-        print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s (headroom={HEADROOM_FACTOR}x)")
+        # Seed-specific deadline: B = q-quantile of calibration costs (same q for all workloads).
+        # B stays fixed for the whole run (no recalibration), as defined in Sec. III.
+        slo_deadline = float(np.quantile(cal_costs, slo_quantile))
+        print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s "
+              f"(q={slo_quantile}, cal_costs median={np.median(cal_costs):.2f}s, "
+              f"max={np.max(cal_costs):.2f}s)")
+        calibration[str(seed)] = {
+            "slo_quantile": slo_quantile,
+            "slo_deadline_sec": slo_deadline,
+            "cal_costs_median_sec": float(np.median(cal_costs)),
+            "cal_costs_max_sec": float(np.max(cal_costs)),
+            "cal_costs_sec": {str(w): float(cc) for w, cc in zip(paired_clients, cal_costs)},
+            "pairing": [[str(w), str(t)] for w, t in pairing],
+        }
+
+        seed_round_rows: list[dict] = []
+        seed_summary_rows: list[dict] = []
 
         for policy in POLICIES:
             print(f"  -> Policy: {policy.upper()}")
@@ -507,11 +634,18 @@ def run(workload_name: str):
 
             cur_clock = 0.0
             cum_bytes = 0
-            misses = 0
-            round_times = []
+            misses = 0          # mid-round availability dropouts
+            timeouts = 0        # clients cut by the server at the deadline
+            round_times = []            # realized (server-side, capped at B) round latency
+            round_times_uncapped = []   # straggler's would-be completion time
             slo_met_flags = []
+            slo_latency_flags = []
             f1_history = []
-            fairness_losses = []
+            jain_history = []
+            selection_counts = {w: 0 for w in paired_clients}
+            participation_counts = {w: 0 for w in paired_clients}
+            time_to_quality = float("nan")
+            reached_target = 0
 
             r = 1
             max_attempts = cfg.rounds * 10
@@ -533,10 +667,14 @@ def run(workload_name: str):
                 selected = select_cohort(policy, available, losses, cost_preds,
                                          slo_deadline, cfg.clients_per_round, rng,
                                          sample_sizes=sample_sizes)
+                for w in selected:
+                    selection_counts[w] += 1
 
                 # 4. Execute training on selected clients
-                states, weights, round_client_times = [], [], []
+                states, weights = [], []
+                round_client_times, uncapped_client_times = [], []
                 round_miss = False
+                round_timeout = False
                 for j, w in enumerate(selected):
                     prof = paired_profiles[w]
                     c = clients_pool[w]
@@ -547,22 +685,40 @@ def run(workload_name: str):
                         max_epochs=10
                     )
                     actual_time = prof.estimate_round_time(len(c["train_y"]), ep, model_size)
-                    round_client_times.append(actual_time)
+                    uncapped_client_times.append(actual_time)
 
-                    # Verify client stayed available during execution
-                    if not prof.is_active(cur_clock + actual_time):
+                    # The server waits for a client at most until the deadline B
+                    wait_end = cur_clock + min(actual_time, slo_deadline)
+
+                    # (a) Exact interval check: does the client drop out before finishing / before B?
+                    drop_at = prof.first_inactive_time(cur_clock, wait_end)
+                    if drop_at is not None:
+                        round_client_times.append(max(drop_at - cur_clock, 0.0))
                         misses += 1
                         round_miss = True
-                    else:
-                        states.append(st)
-                        weights.append(len(c["train_y"]))
+                        continue  # no update received: excluded from aggregation and from feedback
 
-                    # Exponential moving average feedback update
+                    # Measured-work feedback (Sec. III). A client cut by the deadline still
+                    # reports its completion time later, so its prediction is also updated.
                     cost_preds[w] = 0.65 * cost_preds[w] + 0.35 * actual_time
 
+                    # (b) Deadline cut: the server stops waiting at B
+                    if actual_time > slo_deadline:
+                        round_client_times.append(slo_deadline)
+                        timeouts += 1
+                        round_timeout = True
+                        continue  # late update discarded
+
+                    round_client_times.append(actual_time)
+                    states.append(st)
+                    weights.append(len(c["train_y"]))
+                    participation_counts[w] += 1
+
                 round_latency = max(round_client_times) if round_client_times else 0.0
+                round_latency_uncapped = max(uncapped_client_times) if uncapped_client_times else 0.0
                 cur_clock += round_latency
                 round_times.append(round_latency)
+                round_times_uncapped.append(round_latency_uncapped)
 
                 # 5. Aggregate model
                 if states:
@@ -571,19 +727,47 @@ def run(workload_name: str):
                 # 6. Global evaluation
                 acc, f1 = evaluate_global(model, val_X, val_y)
                 f1_history.append(f1)
-                slo_satisfied = int(round_latency <= slo_deadline and not round_miss)
+
+                if reached_target == 0 and f1 >= target_f1:
+                    time_to_quality = cur_clock
+                    reached_target = 1
+
+                # Per-round Jain fairness over local losses of all N clients
+                round_losses = [local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"])
+                                for w in paired_clients]
+                jains_round = jain_index(round_losses)
+                jain_history.append(jains_round)
+
+                # Latency-only SLO (original systems contract), kept as a secondary metric
+                slo_latency_ok = int(round_latency <= slo_deadline and not round_miss and not round_timeout)
+                slo_latency_flags.append(slo_latency_ok)
+
+                # Composite SLO: latency feasibility AND quality floor AND fairness floor
+                slo_satisfied = int(
+                    slo_latency_ok
+                    and f1 >= F1_MIN
+                    and jains_round >= JAIN_MIN
+                )
                 slo_met_flags.append(slo_satisfied)
                 cum_bytes += len(states) * model_size * 2
 
-                all_round_metrics.append({
+                seed_round_rows.append({
                     "workload": workload_name,
                     "seed": seed,
                     "policy": policy,
                     "round": r,
                     "f1": f1,
                     "accuracy": acc,
+                    "jain_round": jains_round,
                     "round_time_sec": round_latency,
+                    "round_time_uncapped_sec": round_latency_uncapped,
                     "slo_deadline_sec": slo_deadline,
+                    "dropout": int(round_miss),
+                    "timeout": int(round_timeout),
+                    "n_aggregated": len(states),
+                    "slo_latency_met": slo_latency_ok,
+                    "f1_floor_met": int(f1 >= F1_MIN),
+                    "jain_floor_met": int(jains_round >= JAIN_MIN),
                     "slo_met": slo_satisfied,
                     "wall_clock_sec": cur_clock,
                     "bytes_round": len(states) * model_size * 2
@@ -592,77 +776,88 @@ def run(workload_name: str):
 
             # Calculate summary metrics for this seed & policy
             p95_time = float(np.percentile(round_times, 95)) if round_times else 0.0
+            p95_time_uncapped = float(np.percentile(round_times_uncapped, 95)) if round_times_uncapped else 0.0
             slo_rate = float(np.mean(slo_met_flags)) if slo_met_flags else 0.0
+            slo_latency_rate = float(np.mean(slo_latency_flags)) if slo_latency_flags else 0.0
+            mean_jain_round = float(np.mean(jain_history)) if jain_history else 0.0
             final_f1 = float(np.mean(f1_history[-5:])) if len(f1_history) >= 5 else 0.0
 
-            # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
-            # 0.50 for WISDM-2019 and 0.22 for FEMNIST to evaluate real convergence velocity
-            target_f1 = 0.22 if workload_name == "femnist" else 0.50
-            time_to_quality = cur_clock
-            for rm in [m for m in all_round_metrics if m["seed"] == seed and m["policy"] == policy]:
-                if rm["f1"] >= target_f1:
-                    time_to_quality = rm["wall_clock_sec"]
-                    break
-
-            # Jain's fairness index over individual client test losses
+            # Jain's fairness index over final client training losses (loss uniformity)
             client_losses = [local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"]) for w in paired_clients]
-            jains_fairness = float((sum(client_losses) ** 2) / (len(client_losses) * sum(l ** 2 for l in client_losses) + 1e-9))
+            jains_fairness = jain_index(client_losses)
+            # Jain's fairness over selection / successful participation counts (representation)
+            jains_selection = jain_index(selection_counts[w] for w in paired_clients)
+            jains_participation = jain_index(participation_counts[w] for w in paired_clients)
 
-            seed_summaries.append({
+            seed_summary_rows.append({
                 "workload": workload_name,
                 "seed": seed,
                 "policy": policy,
                 "final_f1": final_f1,
                 "p95_round_time": p95_time,
+                "p95_round_time_uncapped": p95_time_uncapped,
                 "slo_rate": slo_rate,
+                "slo_latency_rate": slo_latency_rate,
+                "mean_jain_round": mean_jain_round,
                 "availability_misses": misses,
-                "time_to_quality_sec": time_to_quality,
+                "deadline_timeouts": timeouts,
+                "time_to_quality_sec": time_to_quality,   # NaN if target never reached
+                "reached_target": reached_target,
                 "fairness_index": jains_fairness,
+                "fairness_selection": jains_selection,
+                "fairness_participation": jains_participation,
                 "total_bytes": cum_bytes,
-                "total_wall_clock_sec": cur_clock
+                "total_wall_clock_sec": cur_clock,
+                "slo_deadline_sec": slo_deadline,
+                "rounds_completed": len(round_times)
             })
 
-    # Save output artifacts
-    df_rounds = pd.DataFrame(all_round_metrics)
-    df_seeds = pd.DataFrame(seed_summaries)
-    df_rounds.to_csv(OUT_DIR / f"round_metrics_{workload_name}.csv", index=False)
-    df_seeds.to_csv(OUT_DIR / f"seed_summary_{workload_name}.csv", index=False)
-
-    df_agg = df_seeds.groupby("policy").agg({
-        "final_f1": ["mean", "std"],
-        "p95_round_time": ["mean", "std"],
-        "slo_rate": ["mean", "std"],
-        "availability_misses": ["mean", "std"],
-        "time_to_quality_sec": ["mean", "std"],
-        "fairness_index": ["mean", "std"],
-        "total_bytes": ["mean", "std"]
-    }).reset_index()
-    df_agg.to_csv(OUT_DIR / f"aggregate_{workload_name}.csv", index=False)
+        # Checkpoint after every seed (survives Colab disconnections; use --resume to continue)
+        _append_csv(seed_round_rows, rounds_ckpt)
+        _append_csv(seed_summary_rows, seeds_ckpt)
+        calib_path.write_text(json.dumps(calibration, indent=2))
+        aggregate_seed_summaries(pd.read_csv(seeds_ckpt)).to_csv(agg_path, index=False)
+        print(f"  [checkpoint] seed {seed} written to {seeds_ckpt.name}")
 
     summary_cfg = {
         "workload": workload_name,
-        "seeds": SEEDS,
+        "seeds": seeds,
         "policies": POLICIES,
         "clients_per_round": cfg.clients_per_round,
         "rounds": cfg.rounds,
-        "outputs_written": [
-            str(OUT_DIR / f"round_metrics_{workload_name}.csv"),
-            str(OUT_DIR / f"seed_summary_{workload_name}.csv"),
-            str(OUT_DIR / f"aggregate_{workload_name}.csv")
-        ]
+        "slo_rule": f"B = quantile(cal_costs, {slo_quantile}) per seed, fixed during the run",
+        "slo_quantile": slo_quantile,
+        "f1_min": F1_MIN,
+        "jain_min": JAIN_MIN,
+        "ttq_target_f1": target_f1,
+        "out_suffix": out_suffix,
+        "outputs_written": [str(rounds_ckpt), str(seeds_ckpt), str(agg_path), str(calib_path)]
     }
-    (OUT_DIR / f"experiment_config_{workload_name}.json").write_text(json.dumps(summary_cfg, indent=2))
-    print(f"\nExperiment complete! Aggregated results written to {OUT_DIR / f'aggregate_{workload_name}.csv'}")
+    config_path.write_text(json.dumps(summary_cfg, indent=2))
+    print(f"\nExperiment complete! Aggregated results written to {agg_path}")
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workload", choices=WORKLOADS, required=True)
     ap.add_argument("--print-config", action="store_true")
+    ap.add_argument("--seeds", nargs="+", type=int, default=None,
+                    help="Subset of seeds to run (default: all 20 SEEDS)")
+    ap.add_argument("--rounds", type=int, default=None,
+                    help="Override the number of rounds of the workload")
+    ap.add_argument("--slo-quantile", type=float, default=SLO_QUANTILE,
+                    help="Quantile q of calibration costs used as deadline B (ablation: 0.50, 0.75, 0.90)")
+    ap.add_argument("--out-suffix", type=str, default="",
+                    help="Suffix for output files, e.g. _b1 or _q50")
+    ap.add_argument("--resume", action="store_true",
+                    help="Skip seeds already present in the checkpoint with the same suffix")
     args = ap.parse_args()
     if args.print_config:
         print(json.dumps(asdict(WORKLOADS[args.workload]), indent=2))
         return
-    run(args.workload)
+    if not 0.0 < args.slo_quantile <= 1.0:
+        ap.error("--slo-quantile must be in (0, 1]")
+    run(args.workload, seeds=args.seeds, rounds=args.rounds,
+        slo_quantile=args.slo_quantile, out_suffix=args.out_suffix, resume=args.resume)
 
 if __name__ == "__main__":
     main()
