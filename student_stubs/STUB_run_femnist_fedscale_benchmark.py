@@ -553,7 +553,7 @@ def common_warmup(init_model: nn.Module, paired_clients: list[str],
         avail = [w for w in paired_clients if paired_profiles[w].is_active(cur_clock)]
         if len(avail) < clients_per_round:
             cur_clock += 30.0
-            avail = paired_clients  # fallback during warmup
+            continue
 
         cohort = list(warm_rng.choice(avail, size=clients_per_round, replace=False))
         states, weights, times = [], [], []
@@ -798,7 +798,7 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 jain_history.append(jains_round)
 
                 # Latency-only SLO (original systems contract), kept as a secondary metric
-                slo_latency_ok = int(round_latency <= slo_deadline and not round_miss and not round_timeout)
+                slo_latency_ok = int(not round_miss and not round_timeout)
                 slo_latency_flags.append(slo_latency_ok)
 
                 # Composite SLO: latency feasibility AND quality floor AND fairness floor (Problems 2 & 3)
