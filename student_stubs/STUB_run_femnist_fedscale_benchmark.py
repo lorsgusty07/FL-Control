@@ -68,13 +68,7 @@ SEEDS = [17, 29, 43, 59, 71, 89, 107, 131, 167, 197,
 # Seed-specific SLO deadline rule (Sec. III-B): B = q-quantile of calibration costs.
 # The same q is used for every workload; ablate with --slo-quantile 0.50 / 0.90.
 SLO_QUANTILE = 0.75
-POLICIES = ["random", "fastest", "loss", "oort", "flcontrol"]
-
-# SLO declarado por la aplicación (Sec. III-B): presupuesto de TTQ en segundos
-APPLICATION_TTQ_BUDGET_SEC = {
-    "wisdm2019": 4000.0,
-    "femnist":   8000.0,
-}
+POLICIES = ["random", "fastest", "loss", "oort", "flcontrol", "flcontrol_robust", "fastest_df"]
 
 @dataclass(frozen=True)
 class Workload:
@@ -462,7 +456,9 @@ def evaluate_global(model: nn.Module, test_X: np.ndarray, test_y: np.ndarray):
 def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
                   cost_preds: dict[str, float], deadline: float, k: int,
                   rng: np.random.Generator, oort_alpha: float = 1.0,
-                  sample_sizes: dict[str, int] = None) -> tuple[list[str], int]:
+                  sample_sizes: dict[str, int] = None,
+                  cost_robust: dict = None, p_drop: dict = None,
+                  drop_max: float = 1.0) -> tuple[list[str], int]:
     """Select cohort of k clients according to policy.
     Returns: (selected_cohort, fallback_used: int [0 or 1])
     """
@@ -505,6 +501,24 @@ def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
             cand.append((-max_c, sum(utilities[u] for u in comb), comb))
         return list(max(cand)[2]), 1
 
+    if policy == "flcontrol_robust":
+        if cost_robust is None:
+            cost_robust = cost_preds
+        if p_drop is None:
+            p_drop = {u: 0.0 for u in candidates}
+
+        elig = [u for u in candidates if cost_robust[u] <= deadline and p_drop[u] <= drop_max]
+        if len(elig) >= k:
+            util = {u: utilities[u] * (1.0 - p_drop[u]) for u in elig}
+            return sorted(elig, key=lambda u: (util[u], u), reverse=True)[:k], 0
+        # fallback (marcado con flag=1): los k candidatos con menor cost_robust
+        return sorted(candidates, key=lambda u: (cost_robust[u], u))[:k], 1
+
+    if policy == "fastest_df":
+        if p_drop is None:
+            p_drop = {u: 0.0 for u in candidates}
+        return sorted(candidates, key=lambda u: (cost_preds[u] / max(1.0 - p_drop[u], 1e-6), u))[:k], 0
+
     raise ValueError(f"Unknown policy: {policy}")
 
 # ==========================================
@@ -526,7 +540,6 @@ AGG_METRICS = [
     "slo_rate", "slo_latency_rate", "mean_jain_round",
     "availability_misses", "deadline_timeouts", "flcontrol_fallback_rounds",
     "time_to_quality_sec", "reached_target",
-    "ttq_slo_met", "ttq_budget_sec", "ttq_over_budget_sec",
     "fairness_index", "fairness_selection", "fairness_selection_norm",
     "fairness_participation", "fairness_participation_norm",
     "total_bytes", "total_wall_clock_sec", "slo_deadline_sec",
@@ -585,13 +598,18 @@ def common_warmup(init_model: nn.Module, paired_clients: list[str],
 
 def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_QUANTILE,
         f1_min: float = None, jain_min: float = 0.50, warmup_rounds: int = 10,
-        out_suffix: str = "", resume: bool = False,
-        ttq_budget: float = None):
+        margin: float = 0.0, drop_max: float = 1.0, policies: list[str] = None,
+        out_suffix: str = "", resume: bool = False):
     assert_sources(workload_name)
     cfg = WORKLOADS[workload_name]
     if rounds:
         cfg = replace(cfg, rounds=int(rounds))
     seeds = [int(s) for s in (seeds or SEEDS)]
+
+    policies_to_run = list(policies) if policies else list(POLICIES)
+    for p in policies_to_run:
+        if p not in POLICIES:
+            raise ValueError(f"Unknown policy: {p}. Available: {POLICIES}")
 
     # Problem 2 & 3: realistic reachable thresholds
     # F1_MIN default: 0.45 for WISDM-2019, 0.20 for FEMNIST
@@ -616,8 +634,10 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
     calibration: dict = {}
     if resume and seeds_ckpt.exists():
         prev = pd.read_csv(seeds_ckpt)
-        n_pol = prev.groupby("seed")["policy"].nunique()
-        done_seeds = {int(s) for s in n_pol[n_pol == len(POLICIES)].index}
+        # Check which seeds have all target policies for this run.
+        # If an old checkpoint has fewer policies, those seeds are NOT considered complete.
+        done_seeds = {int(s) for s, grp in prev.groupby("seed")
+                      if set(policies_to_run).issubset(set(grp["policy"]))}
         if calib_path.exists():
             calibration = json.loads(calib_path.read_text())
         print(f"Resuming {tag}: seeds already complete -> {sorted(done_seeds)}")
@@ -628,10 +648,6 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
 
     # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
     target_f1 = 0.20 if workload_name == "femnist" else 0.50
-    # NUEVO: SLO declarado por la aplicación
-    ttq_budget = float(ttq_budget) if ttq_budget is not None \
-                 else float(APPLICATION_TTQ_BUDGET_SEC[workload_name])
-    print(f"Application TTQ budget: {ttq_budget:.0f}s (target F1 = {target_f1})")
 
     for seed in seeds:
         if seed in done_seeds:
@@ -690,12 +706,15 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
         seed_round_rows: list[dict] = []
         seed_summary_rows: list[dict] = []
 
-        for policy in POLICIES:
+        for policy in policies_to_run:
             print(f"  -> Policy: {policy.upper()}")
             # All policies start from the exact identical warm_model
             model = copy.deepcopy(warm_model)
             rng = np.random.default_rng(seed + sum(map(ord, policy)))
             cost_preds = {w: cal_costs[i] for i, w in enumerate(paired_clients)}
+            last_actual = {}                                   # último actual_time observado por cliente (CAMBIO 1)
+            sel_n  = {w: 0 for w in paired_clients}            # veces seleccionado (CAMBIO 1)
+            drop_n = {w: 0 for w in paired_clients}            # veces que se cayó (dropout) (CAMBIO 1)
 
             cur_clock = 0.0
             cum_bytes = 0
@@ -733,13 +752,20 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 losses = {w: local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"]) for w in available}
                 sample_sizes = {w: len(clients_pool[w]["train_y"]) for w in available}
 
+                # CAMBIO 2: Cálculo previo a la selección
+                p_drop = {w: (drop_n[w] + 1) / (sel_n[w] + 2) for w in available}        # suavizado de Laplace
+                cost_robust = {w: max(cost_preds[w], last_actual.get(w, 0.0)) * (1.0 + margin) for w in available}
+
                 # 3. Select cohort
                 selected, fallback_used = select_cohort(policy, available, losses, cost_preds,
                                                         slo_deadline, cfg.clients_per_round, rng,
-                                                        sample_sizes=sample_sizes)
+                                                        sample_sizes=sample_sizes,
+                                                        cost_robust=cost_robust, p_drop=p_drop,
+                                                        drop_max=drop_max)
                 fallback_rounds += fallback_used
                 for w in selected:
                     selection_counts[w] += 1
+                    sel_n[w] += 1  # CAMBIO 1
 
                 # 4. Execute training on selected clients
                 states, weights = [], []
@@ -767,11 +793,13 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                         round_client_times.append(max(drop_at - cur_clock, 0.0))
                         misses += 1
                         round_miss = True
+                        drop_n[w] += 1  # CAMBIO 1
                         continue  # no update received: excluded from aggregation and from feedback
 
                     # Measured-work feedback (Sec. III). A client cut by the deadline still
                     # reports its completion time later, so its prediction is also updated.
                     cost_preds[w] = 0.65 * cost_preds[w] + 0.35 * actual_time
+                    last_actual[w] = actual_time  # CAMBIO 1
 
                     # (b) Deadline cut: the server stops waiting at B
                     if actual_time > slo_deadline:
@@ -819,6 +847,12 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 slo_met_flags.append(slo_satisfied)
                 cum_bytes += len(states) * model_size * 2
 
+                # CAMBIO 6: Registro de diagnóstico n_elig
+                if policy == "flcontrol_robust":
+                    n_elig = len([u for u in available if cost_robust[u] <= slo_deadline and p_drop[u] <= drop_max])
+                else:
+                    n_elig = -1
+
                 seed_round_rows.append({
                     "workload": workload_name,
                     "seed": seed,
@@ -833,6 +867,7 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                     "dropout": int(round_miss),
                     "timeout": int(round_timeout),
                     "fallback_used": fallback_used,
+                    "n_elig": n_elig,
                     "n_aggregated": len(states),
                     "slo_latency_met": slo_latency_ok,
                     "f1_floor_met": int(f1 >= f1_min),
@@ -876,20 +911,8 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 "availability_misses": misses,
                 "deadline_timeouts": timeouts,
                 "flcontrol_fallback_rounds": fallback_rounds,
-                "time_to_quality_sec": time_to_quality,
+                "time_to_quality_sec": time_to_quality,   # NaN if target never reached
                 "reached_target": reached_target,
-                # NUEVO: TTQ-SLO — ¿se alcanzó la calidad objetivo dentro del presupuesto declarado?
-                "ttq_slo_met": int(
-                    reached_target == 1
-                    and not np.isnan(time_to_quality)
-                    and time_to_quality <= ttq_budget
-                ),
-                "ttq_budget_sec": ttq_budget,
-                "ttq_over_budget_sec": (
-                    float(time_to_quality - ttq_budget)
-                    if reached_target == 1 and not np.isnan(time_to_quality)
-                    else float("nan")
-                ),
                 "fairness_index": jains_fairness,
                 "fairness_selection": jains_selection,
                 "fairness_selection_norm": jains_selection_norm,
@@ -911,18 +934,17 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
     summary_cfg = {
         "workload": workload_name,
         "seeds": seeds,
-        "policies": POLICIES,
+        "policies": policies_to_run,
         "clients_per_round": cfg.clients_per_round,
         "rounds": cfg.rounds,
         "slo_rule": f"B = quantile(cal_costs, {slo_quantile}) per seed from {warmup_rounds}-round warm_model",
         "slo_quantile": slo_quantile,
         "warmup_rounds": warmup_rounds,
+        "margin": margin,
+        "drop_max": drop_max,
         "f1_min": f1_min,
         "jain_min": jain_min,
         "ttq_target_f1": target_f1,
-        "ttq_budget_sec": ttq_budget,                              # <-- NUEVO
-        "primary_slo": "ttq_slo_met (application contract)",       # <-- NUEVO
-        "secondary_slo": "slo_latency_rate (per-round systems)",   # <-- NUEVO
         "out_suffix": out_suffix,
         "outputs_written": [str(rounds_ckpt), str(seeds_ckpt), str(agg_path), str(calib_path)]
     }
@@ -935,19 +957,22 @@ def main():
     ap.add_argument("--print-config", action="store_true")
     ap.add_argument("--seeds", nargs="+", type=int, default=None,
                     help="Subset of seeds to run (default: all 20 SEEDS)")
+    ap.add_argument("--policies", nargs="+", choices=POLICIES, default=None,
+                    help="Subset of policies to run (default: all POLICIES)")
     ap.add_argument("--rounds", type=int, default=None,
                     help="Override the number of rounds of the workload")
     ap.add_argument("--slo-quantile", type=float, default=SLO_QUANTILE,
                     help="Quantile q of calibration costs used as deadline B (ablation: 0.50, 0.75, 0.90)")
+    ap.add_argument("--margin", type=float, default=0.0,
+                    help="Safety margin on predicted cost for flcontrol_robust (default: 0.0)")
+    ap.add_argument("--drop-max", type=float, default=1.0,
+                    help="Maximum dropout probability threshold for flcontrol_robust (default: 1.0)")
     ap.add_argument("--f1-min", type=float, default=None,
                     help="F1 quality floor for composite SLO (default: 0.45 for wisdm2019, 0.20 for femnist)")
     ap.add_argument("--jain-min", type=float, default=0.50,
                     help="Jain fairness floor for composite SLO (default: 0.50)")
     ap.add_argument("--warmup-rounds", type=int, default=10,
                     help="Number of common FedAvg warmup rounds before calibration (default: 10)")
-    ap.add_argument("--ttq-budget", type=float, default=None,
-                    help="Override the application TTQ budget in seconds "
-                         "(default: 4000 for wisdm2019, 8000 for femnist)")
     ap.add_argument("--out-suffix", type=str, default="",
                     help="Suffix for output files, e.g. _b1 or _q50")
     ap.add_argument("--resume", action="store_true",
@@ -960,8 +985,8 @@ def main():
         ap.error("--slo-quantile must be in (0, 1]")
     run(args.workload, seeds=args.seeds, rounds=args.rounds,
         slo_quantile=args.slo_quantile, f1_min=args.f1_min, jain_min=args.jain_min,
-        warmup_rounds=args.warmup_rounds, out_suffix=args.out_suffix, resume=args.resume,
-        ttq_budget=args.ttq_budget)
+        warmup_rounds=args.warmup_rounds, margin=args.margin, drop_max=args.drop_max,
+        policies=args.policies, out_suffix=args.out_suffix, resume=args.resume)
 
 if __name__ == "__main__":
     main()
