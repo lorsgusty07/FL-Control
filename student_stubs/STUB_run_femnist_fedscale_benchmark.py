@@ -70,6 +70,12 @@ SEEDS = [17, 29, 43, 59, 71, 89, 107, 131, 167, 197,
 SLO_QUANTILE = 0.75
 POLICIES = ["random", "fastest", "loss", "oort", "flcontrol"]
 
+# SLO declarado por la aplicación (Sec. III-B): presupuesto de TTQ en segundos
+APPLICATION_TTQ_BUDGET_SEC = {
+    "wisdm2019": 4000.0,
+    "femnist":   8000.0,
+}
+
 @dataclass(frozen=True)
 class Workload:
     name: str
@@ -520,6 +526,7 @@ AGG_METRICS = [
     "slo_rate", "slo_latency_rate", "mean_jain_round",
     "availability_misses", "deadline_timeouts", "flcontrol_fallback_rounds",
     "time_to_quality_sec", "reached_target",
+    "ttq_slo_met", "ttq_budget_sec", "ttq_over_budget_sec",
     "fairness_index", "fairness_selection", "fairness_selection_norm",
     "fairness_participation", "fairness_participation_norm",
     "total_bytes", "total_wall_clock_sec", "slo_deadline_sec",
@@ -578,7 +585,8 @@ def common_warmup(init_model: nn.Module, paired_clients: list[str],
 
 def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_QUANTILE,
         f1_min: float = None, jain_min: float = 0.50, warmup_rounds: int = 10,
-        out_suffix: str = "", resume: bool = False):
+        out_suffix: str = "", resume: bool = False,
+        ttq_budget: float = None):
     assert_sources(workload_name)
     cfg = WORKLOADS[workload_name]
     if rounds:
@@ -620,6 +628,10 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
 
     # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
     target_f1 = 0.20 if workload_name == "femnist" else 0.50
+    # NUEVO: SLO declarado por la aplicación
+    ttq_budget = float(ttq_budget) if ttq_budget is not None \
+                 else float(APPLICATION_TTQ_BUDGET_SEC[workload_name])
+    print(f"Application TTQ budget: {ttq_budget:.0f}s (target F1 = {target_f1})")
 
     for seed in seeds:
         if seed in done_seeds:
@@ -797,16 +809,13 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 jains_round = jain_index(round_losses)
                 jain_history.append(jains_round)
 
-                # Latency-only SLO (original systems contract), kept as a secondary metric
+                # Latency SLO per round (sistemas, secundario)
                 slo_latency_ok = int(not round_miss and not round_timeout)
                 slo_latency_flags.append(slo_latency_ok)
 
-                # Composite SLO: latency feasibility AND quality floor AND fairness floor (Problems 2 & 3)
-                slo_satisfied = int(
-                    slo_latency_ok
-                    and f1 >= f1_min
-                    and jains_round >= jain_min
-                )
+                # Composite SLO simplificado: solo latencia + disponibilidad.
+                # El contrato real de la aplicación es TTQ (se evalúa al final del seed).
+                slo_satisfied = slo_latency_ok
                 slo_met_flags.append(slo_satisfied)
                 cum_bytes += len(states) * model_size * 2
 
@@ -867,8 +876,20 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 "availability_misses": misses,
                 "deadline_timeouts": timeouts,
                 "flcontrol_fallback_rounds": fallback_rounds,
-                "time_to_quality_sec": time_to_quality,   # NaN if target never reached
+                "time_to_quality_sec": time_to_quality,
                 "reached_target": reached_target,
+                # NUEVO: TTQ-SLO — ¿se alcanzó la calidad objetivo dentro del presupuesto declarado?
+                "ttq_slo_met": int(
+                    reached_target == 1
+                    and not np.isnan(time_to_quality)
+                    and time_to_quality <= ttq_budget
+                ),
+                "ttq_budget_sec": ttq_budget,
+                "ttq_over_budget_sec": (
+                    float(time_to_quality - ttq_budget)
+                    if reached_target == 1 and not np.isnan(time_to_quality)
+                    else float("nan")
+                ),
                 "fairness_index": jains_fairness,
                 "fairness_selection": jains_selection,
                 "fairness_selection_norm": jains_selection_norm,
@@ -899,6 +920,9 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
         "f1_min": f1_min,
         "jain_min": jain_min,
         "ttq_target_f1": target_f1,
+        "ttq_budget_sec": ttq_budget,                              # <-- NUEVO
+        "primary_slo": "ttq_slo_met (application contract)",       # <-- NUEVO
+        "secondary_slo": "slo_latency_rate (per-round systems)",   # <-- NUEVO
         "out_suffix": out_suffix,
         "outputs_written": [str(rounds_ckpt), str(seeds_ckpt), str(agg_path), str(calib_path)]
     }
@@ -921,6 +945,9 @@ def main():
                     help="Jain fairness floor for composite SLO (default: 0.50)")
     ap.add_argument("--warmup-rounds", type=int, default=10,
                     help="Number of common FedAvg warmup rounds before calibration (default: 10)")
+    ap.add_argument("--ttq-budget", type=float, default=None,
+                    help="Override the application TTQ budget in seconds "
+                         "(default: 4000 for wisdm2019, 8000 for femnist)")
     ap.add_argument("--out-suffix", type=str, default="",
                     help="Suffix for output files, e.g. _b1 or _q50")
     ap.add_argument("--resume", action="store_true",
@@ -933,7 +960,8 @@ def main():
         ap.error("--slo-quantile must be in (0, 1]")
     run(args.workload, seeds=args.seeds, rounds=args.rounds,
         slo_quantile=args.slo_quantile, f1_min=args.f1_min, jain_min=args.jain_min,
-        warmup_rounds=args.warmup_rounds, out_suffix=args.out_suffix, resume=args.resume)
+        warmup_rounds=args.warmup_rounds, out_suffix=args.out_suffix, resume=args.resume,
+        ttq_budget=args.ttq_budget)
 
 if __name__ == "__main__":
     main()
