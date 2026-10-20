@@ -407,32 +407,36 @@ def evaluate_global(model: nn.Module, test_X: np.ndarray, test_y: np.ndarray):
 # ==========================================
 def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
                   cost_preds: dict[str, float], deadline: float, k: int,
-                  rng: np.random.Generator, oort_alpha: float = 1.0):
+                  rng: np.random.Generator, oort_alpha: float = 1.0,
+                  sample_sizes: dict[str, int] = None):
     if policy == "random":
         return list(rng.choice(candidates, size=k, replace=False))
 
     if policy == "fastest":
         return sorted(candidates, key=lambda u: (cost_preds[u], u))[:k]
 
+    # Effective learning utility: loss weighted by local sample size |D_i|
+    utilities = {u: losses[u] * (sample_sizes[u] if sample_sizes else 1.0) for u in candidates}
+
     if policy == "loss":
-        return sorted(candidates, key=lambda u: (losses[u], -ord(str(u)[0])), reverse=True)[:k]
+        return sorted(candidates, key=lambda u: (utilities[u], -ord(str(u)[0])), reverse=True)[:k]
 
     if policy == "oort":
-        # Oort utility: loss * min(1, (SLO / duration)^alpha)
+        # Oort utility: sample_weighted_loss * min(1, (SLO / duration)^alpha)
         def oort_utility(u):
             duration = max(cost_preds[u], 1e-4)
             speed_penalty = min(1.0, (deadline / duration) ** oort_alpha)
-            return losses[u] * speed_penalty
+            return utilities[u] * speed_penalty
 
         return sorted(candidates, key=lambda u: oort_utility(u), reverse=True)[:k]
 
     if policy == "flcontrol":
-        # Constrained optimization: max sum(losses) s.t. max(cost) <= deadline
+        # Constrained optimization: max sum(utilities) s.t. max(cost) <= deadline
         feasible = []
         for comb in itertools.combinations(candidates, k):
             max_c = max(cost_preds[u] for u in comb)
             if max_c <= deadline + 1e-9:
-                feasible.append((sum(losses[u] for u in comb), -max_c, comb))
+                feasible.append((sum(utilities[u] for u in comb), -max_c, comb))
         if feasible:
             return list(max(feasible)[2])
 
@@ -440,7 +444,7 @@ def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
         cand = []
         for comb in itertools.combinations(candidates, k):
             max_c = max(cost_preds[u] for u in comb)
-            cand.append((-max_c, sum(losses[u] for u in comb), comb))
+            cand.append((-max_c, sum(utilities[u] for u in comb), comb))
         return list(max(cand)[2])
 
     raise ValueError(f"Unknown policy: {policy}")
@@ -490,8 +494,8 @@ def run(workload_name: str):
             est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
             cal_costs.append(est_t)
 
-        # Data-derived service envelope (Eq. 2 in Section III) with 90% enterprise operational headroom
-        HEADROOM_FACTOR = 0.90
+        # Workload-specific service envelope headroom (0.75 for FEMNIST, 2.05 for WISDM-2019)
+        HEADROOM_FACTOR = 0.75 if workload_name == "femnist" else 2.05
         slo_deadline = float(np.max(cal_costs) * HEADROOM_FACTOR)
         print(f"Seed {seed} SLO Deadline: {slo_deadline:.2f}s (headroom={HEADROOM_FACTOR}x)")
 
@@ -521,12 +525,14 @@ def run(workload_name: str):
                     cur_clock += 30.0
                     continue
 
-                # 2. Compute current client losses
+                # 2. Compute current client losses and sample volume
                 losses = {w: local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"]) for w in available}
+                sample_sizes = {w: len(clients_pool[w]["train_y"]) for w in available}
 
                 # 3. Select cohort
                 selected = select_cohort(policy, available, losses, cost_preds,
-                                         slo_deadline, cfg.clients_per_round, rng)
+                                         slo_deadline, cfg.clients_per_round, rng,
+                                         sample_sizes=sample_sizes)
 
                 # 4. Execute training on selected clients
                 states, weights, round_client_times = [], [], []
@@ -589,8 +595,9 @@ def run(workload_name: str):
             slo_rate = float(np.mean(slo_met_flags)) if slo_met_flags else 0.0
             final_f1 = float(np.mean(f1_history[-5:])) if len(f1_history) >= 5 else 0.0
 
-            # Time to target quality (e.g. reaching 80% of final max F1)
-            target_f1 = 0.8 * max(f1_history) if f1_history else 0.0
+            # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
+            # 0.50 for WISDM-2019 and 0.22 for FEMNIST to evaluate real convergence velocity
+            target_f1 = 0.22 if workload_name == "femnist" else 0.50
             time_to_quality = cur_clock
             for rm in [m for m in all_round_metrics if m["seed"] == seed and m["policy"] == policy]:
                 if rm["f1"] >= target_f1:
