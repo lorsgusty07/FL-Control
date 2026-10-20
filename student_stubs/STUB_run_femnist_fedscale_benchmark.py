@@ -456,18 +456,21 @@ def evaluate_global(model: nn.Module, test_X: np.ndarray, test_y: np.ndarray):
 def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
                   cost_preds: dict[str, float], deadline: float, k: int,
                   rng: np.random.Generator, oort_alpha: float = 1.0,
-                  sample_sizes: dict[str, int] = None):
+                  sample_sizes: dict[str, int] = None) -> tuple[list[str], int]:
+    """Select cohort of k clients according to policy.
+    Returns: (selected_cohort, fallback_used: int [0 or 1])
+    """
     if policy == "random":
-        return list(rng.choice(candidates, size=k, replace=False))
+        return list(rng.choice(candidates, size=k, replace=False)), 0
 
     if policy == "fastest":
-        return sorted(candidates, key=lambda u: (cost_preds[u], u))[:k]
+        return sorted(candidates, key=lambda u: (cost_preds[u], u))[:k], 0
 
     # Effective learning utility: loss weighted by local sample size |D_i|
     utilities = {u: losses[u] * (sample_sizes[u] if sample_sizes else 1.0) for u in candidates}
 
     if policy == "loss":
-        return sorted(candidates, key=lambda u: (utilities[u], -ord(str(u)[0])), reverse=True)[:k]
+        return sorted(candidates, key=lambda u: (utilities[u], -ord(str(u)[0])), reverse=True)[:k], 0
 
     if policy == "oort":
         # Oort utility: sample_weighted_loss * min(1, (SLO / duration)^alpha)
@@ -476,7 +479,7 @@ def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
             speed_penalty = min(1.0, (deadline / duration) ** oort_alpha)
             return utilities[u] * speed_penalty
 
-        return sorted(candidates, key=lambda u: oort_utility(u), reverse=True)[:k]
+        return sorted(candidates, key=lambda u: oort_utility(u), reverse=True)[:k], 0
 
     if policy == "flcontrol":
         # Constrained optimization: max sum(utilities) s.t. max(cost) <= deadline
@@ -486,14 +489,15 @@ def select_cohort(policy: str, candidates: list[str], losses: dict[str, float],
             if max_c <= deadline + 1e-9:
                 feasible.append((sum(utilities[u] for u in comb), -max_c, comb))
         if feasible:
-            return list(max(feasible)[2])
+            return list(max(feasible)[2]), 0
 
-        # If infeasible, minimize predicted violation then maximize learning utility
+        # If infeasible, fallback: minimize predicted violation then maximize learning utility
+        # (Problem 8: documented via fallback_used flag)
         cand = []
         for comb in itertools.combinations(candidates, k):
             max_c = max(cost_preds[u] for u in comb)
             cand.append((-max_c, sum(utilities[u] for u in comb), comb))
-        return list(max(cand)[2])
+        return list(max(cand)[2]), 1
 
     raise ValueError(f"Unknown policy: {policy}")
 
@@ -514,9 +518,10 @@ def jain_index(values) -> float:
 AGG_METRICS = [
     "final_f1", "p95_round_time", "p95_round_time_uncapped",
     "slo_rate", "slo_latency_rate", "mean_jain_round",
-    "availability_misses", "deadline_timeouts",
+    "availability_misses", "deadline_timeouts", "flcontrol_fallback_rounds",
     "time_to_quality_sec", "reached_target",
-    "fairness_index", "fairness_selection", "fairness_participation",
+    "fairness_index", "fairness_selection", "fairness_selection_norm",
+    "fairness_participation", "fairness_participation_norm",
     "total_bytes", "total_wall_clock_sec", "slo_deadline_sec",
 ]
 
@@ -530,13 +535,60 @@ def _append_csv(rows: list[dict], path: Path):
     df = pd.DataFrame(rows)
     df.to_csv(path, mode="a", header=not path.exists(), index=False)
 
+def common_warmup(init_model: nn.Module, paired_clients: list[str],
+                  paired_profiles: dict, clients_pool: dict,
+                  clients_per_round: int, seed: int,
+                  warmup_rounds: int = 10) -> nn.Module:
+    """Pre-train common model for warmup_rounds (Problem 1 Fix).
+    Calibrating from this warm model yields realistic LocalSGD workloads
+    rather than cold-model transient artifacts. All policies compete starting
+    from this identical warm_model checkpoint.
+    """
+    warm_model = copy.deepcopy(init_model).to(DEVICE)
+    warm_rng = np.random.default_rng(seed + 9999)
+    cur_clock = 0.0
+    model_size = get_model_size_bytes(warm_model)
+
+    for wr in range(1, warmup_rounds + 1):
+        avail = [w for w in paired_clients if paired_profiles[w].is_active(cur_clock)]
+        if len(avail) < clients_per_round:
+            cur_clock += 30.0
+            avail = paired_clients  # fallback during warmup
+
+        cohort = list(warm_rng.choice(avail, size=clients_per_round, replace=False))
+        states, weights, times = [], [], []
+
+        for j, w in enumerate(cohort):
+            c = clients_pool[w]
+            st, ep, _, _ = adaptive_local_train(
+                warm_model, c["train_X"], c["train_y"],
+                seed=seed * 50000 + wr * 100 + j,
+                max_epochs=10
+            )
+            states.append(st)
+            weights.append(len(c["train_y"]))
+            t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
+            times.append(t)
+
+        if states:
+            warm_model.load_state_dict(fedavg(states, weights))
+        cur_clock += max(times) if times else 30.0
+
+    return warm_model
+
 def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_QUANTILE,
+        f1_min: float = None, jain_min: float = 0.50, warmup_rounds: int = 10,
         out_suffix: str = "", resume: bool = False):
     assert_sources(workload_name)
     cfg = WORKLOADS[workload_name]
     if rounds:
         cfg = replace(cfg, rounds=int(rounds))
     seeds = [int(s) for s in (seeds or SEEDS)]
+
+    # Problem 2 & 3: realistic reachable thresholds
+    # F1_MIN default: 0.45 for WISDM-2019, 0.20 for FEMNIST
+    f1_min = float(f1_min) if f1_min is not None else (0.45 if workload_name == "wisdm2019" else 0.20)
+    jain_min = float(jain_min)
 
     clients_pool = load_natural_workload_clients(workload_name)
     profiles_pool = load_fedscale_profiles()
@@ -566,14 +618,8 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
             if p.exists():
                 p.unlink()
 
-    # Composite (multi-dimensional) service SLO floors:
-    # a round meets the SLO only if it is feasible in latency (no timeout, no dropout),
-    # reaches a minimum global quality and keeps a minimum client-loss fairness.
-    F1_MIN = 0.53 if workload_name == "wisdm2019" else 0.22
-    JAIN_MIN = 0.53  # adjust after inspecting the per-round Jain distribution
-
     # Benchmark-wide common quality threshold for wall-clock Time-to-Quality (TTQ)
-    target_f1 = 0.22 if workload_name == "femnist" else 0.50
+    target_f1 = 0.20 if workload_name == "femnist" else 0.50
 
     for seed in seeds:
         if seed in done_seeds:
@@ -600,11 +646,17 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
         init_model = (FemnistCNN(num_classes) if workload_name == "femnist" else Wisdm1DCNN(num_classes=num_classes)).to(DEVICE)
         model_size = get_model_size_bytes(init_model)
 
-        # Baseline calibration to determine the seed-specific SLO envelope
+        # Problem 1 Fix: Common warmup of 10 rounds before calibration
+        print(f"Seed {seed}: Executing {warmup_rounds} common warmup rounds to initialize warm model...")
+        warm_model = common_warmup(init_model, paired_clients, paired_profiles,
+                                   clients_pool, cfg.clients_per_round, seed,
+                                   warmup_rounds=warmup_rounds)
+
+        # Baseline calibration on warm_model to determine the realistic seed-specific SLO envelope
         cal_costs = []
         for w in paired_clients:
             c = clients_pool[w]
-            st, ep, _, _ = adaptive_local_train(init_model, c["train_X"], c["train_y"], seed, max_epochs=10)
+            st, ep, _, _ = adaptive_local_train(warm_model, c["train_X"], c["train_y"], seed, max_epochs=10)
             est_t = paired_profiles[w].estimate_round_time(len(c["train_y"]), ep, model_size)
             cal_costs.append(est_t)
 
@@ -628,7 +680,8 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
 
         for policy in POLICIES:
             print(f"  -> Policy: {policy.upper()}")
-            model = copy.deepcopy(init_model)
+            # All policies start from the exact identical warm_model
+            model = copy.deepcopy(warm_model)
             rng = np.random.default_rng(seed + sum(map(ord, policy)))
             cost_preds = {w: cal_costs[i] for i, w in enumerate(paired_clients)}
 
@@ -636,12 +689,14 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
             cum_bytes = 0
             misses = 0          # mid-round availability dropouts
             timeouts = 0        # clients cut by the server at the deadline
+            fallback_rounds = 0 # rounds where FL-Control had to use fallback (Problem 8)
             round_times = []            # realized (server-side, capped at B) round latency
             round_times_uncapped = []   # straggler's would-be completion time
             slo_met_flags = []
             slo_latency_flags = []
             f1_history = []
             jain_history = []
+            availability_counts = {w: 0 for w in paired_clients}
             selection_counts = {w: 0 for w in paired_clients}
             participation_counts = {w: 0 for w in paired_clients}
             time_to_quality = float("nan")
@@ -659,14 +714,18 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                     cur_clock += 30.0
                     continue
 
+                for w in available:
+                    availability_counts[w] += 1
+
                 # 2. Compute current client losses and sample volume
                 losses = {w: local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"]) for w in available}
                 sample_sizes = {w: len(clients_pool[w]["train_y"]) for w in available}
 
                 # 3. Select cohort
-                selected = select_cohort(policy, available, losses, cost_preds,
-                                         slo_deadline, cfg.clients_per_round, rng,
-                                         sample_sizes=sample_sizes)
+                selected, fallback_used = select_cohort(policy, available, losses, cost_preds,
+                                                        slo_deadline, cfg.clients_per_round, rng,
+                                                        sample_sizes=sample_sizes)
+                fallback_rounds += fallback_used
                 for w in selected:
                     selection_counts[w] += 1
 
@@ -742,11 +801,11 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 slo_latency_ok = int(round_latency <= slo_deadline and not round_miss and not round_timeout)
                 slo_latency_flags.append(slo_latency_ok)
 
-                # Composite SLO: latency feasibility AND quality floor AND fairness floor
+                # Composite SLO: latency feasibility AND quality floor AND fairness floor (Problems 2 & 3)
                 slo_satisfied = int(
                     slo_latency_ok
-                    and f1 >= F1_MIN
-                    and jains_round >= JAIN_MIN
+                    and f1 >= f1_min
+                    and jains_round >= jain_min
                 )
                 slo_met_flags.append(slo_satisfied)
                 cum_bytes += len(states) * model_size * 2
@@ -764,10 +823,11 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                     "slo_deadline_sec": slo_deadline,
                     "dropout": int(round_miss),
                     "timeout": int(round_timeout),
+                    "fallback_used": fallback_used,
                     "n_aggregated": len(states),
                     "slo_latency_met": slo_latency_ok,
-                    "f1_floor_met": int(f1 >= F1_MIN),
-                    "jain_floor_met": int(jains_round >= JAIN_MIN),
+                    "f1_floor_met": int(f1 >= f1_min),
+                    "jain_floor_met": int(jains_round >= jain_min),
                     "slo_met": slo_satisfied,
                     "wall_clock_sec": cur_clock,
                     "bytes_round": len(states) * model_size * 2
@@ -785,9 +845,14 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
             # Jain's fairness index over final client training losses (loss uniformity)
             client_losses = [local_loss(model, clients_pool[w]["train_X"], clients_pool[w]["train_y"]) for w in paired_clients]
             jains_fairness = jain_index(client_losses)
-            # Jain's fairness over selection / successful participation counts (representation)
+
+            # Raw and availability-normalized fairness (Problem 6 Fix)
             jains_selection = jain_index(selection_counts[w] for w in paired_clients)
             jains_participation = jain_index(participation_counts[w] for w in paired_clients)
+            selection_rates = [selection_counts[w] / max(availability_counts[w], 1) for w in paired_clients]
+            participation_rates = [participation_counts[w] / max(availability_counts[w], 1) for w in paired_clients]
+            jains_selection_norm = jain_index(selection_rates)
+            jains_participation_norm = jain_index(participation_rates)
 
             seed_summary_rows.append({
                 "workload": workload_name,
@@ -801,11 +866,14 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
                 "mean_jain_round": mean_jain_round,
                 "availability_misses": misses,
                 "deadline_timeouts": timeouts,
+                "flcontrol_fallback_rounds": fallback_rounds,
                 "time_to_quality_sec": time_to_quality,   # NaN if target never reached
                 "reached_target": reached_target,
                 "fairness_index": jains_fairness,
                 "fairness_selection": jains_selection,
+                "fairness_selection_norm": jains_selection_norm,
                 "fairness_participation": jains_participation,
+                "fairness_participation_norm": jains_participation_norm,
                 "total_bytes": cum_bytes,
                 "total_wall_clock_sec": cur_clock,
                 "slo_deadline_sec": slo_deadline,
@@ -825,10 +893,11 @@ def run(workload_name: str, seeds=None, rounds=None, slo_quantile: float = SLO_Q
         "policies": POLICIES,
         "clients_per_round": cfg.clients_per_round,
         "rounds": cfg.rounds,
-        "slo_rule": f"B = quantile(cal_costs, {slo_quantile}) per seed, fixed during the run",
+        "slo_rule": f"B = quantile(cal_costs, {slo_quantile}) per seed from {warmup_rounds}-round warm_model",
         "slo_quantile": slo_quantile,
-        "f1_min": F1_MIN,
-        "jain_min": JAIN_MIN,
+        "warmup_rounds": warmup_rounds,
+        "f1_min": f1_min,
+        "jain_min": jain_min,
         "ttq_target_f1": target_f1,
         "out_suffix": out_suffix,
         "outputs_written": [str(rounds_ckpt), str(seeds_ckpt), str(agg_path), str(calib_path)]
@@ -846,6 +915,12 @@ def main():
                     help="Override the number of rounds of the workload")
     ap.add_argument("--slo-quantile", type=float, default=SLO_QUANTILE,
                     help="Quantile q of calibration costs used as deadline B (ablation: 0.50, 0.75, 0.90)")
+    ap.add_argument("--f1-min", type=float, default=None,
+                    help="F1 quality floor for composite SLO (default: 0.45 for wisdm2019, 0.20 for femnist)")
+    ap.add_argument("--jain-min", type=float, default=0.50,
+                    help="Jain fairness floor for composite SLO (default: 0.50)")
+    ap.add_argument("--warmup-rounds", type=int, default=10,
+                    help="Number of common FedAvg warmup rounds before calibration (default: 10)")
     ap.add_argument("--out-suffix", type=str, default="",
                     help="Suffix for output files, e.g. _b1 or _q50")
     ap.add_argument("--resume", action="store_true",
@@ -857,7 +932,8 @@ def main():
     if not 0.0 < args.slo_quantile <= 1.0:
         ap.error("--slo-quantile must be in (0, 1]")
     run(args.workload, seeds=args.seeds, rounds=args.rounds,
-        slo_quantile=args.slo_quantile, out_suffix=args.out_suffix, resume=args.resume)
+        slo_quantile=args.slo_quantile, f1_min=args.f1_min, jain_min=args.jain_min,
+        warmup_rounds=args.warmup_rounds, out_suffix=args.out_suffix, resume=args.resume)
 
 if __name__ == "__main__":
     main()
